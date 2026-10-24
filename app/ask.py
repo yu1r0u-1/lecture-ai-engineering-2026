@@ -21,25 +21,46 @@ from app.config import MODEL, api_error_message, get_api_key
 DEFAULT_QUESTION = "AIE2026の講座の宿題にある「3レベル」とは何ですか？"
 
 
-def ask(question: str) -> str:
-    client = genai.Client(api_key=get_api_key())
-    response = client.models.generate_content(model=MODEL, contents=question)
+def ask(question: str, chat=None) -> str:
+    if chat is None:
+        client = genai.Client(api_key=get_api_key())
+        chat = client.chats.create(model=MODEL)
 
-    # TODO(第1回 演習): response.usage_metadata から
-    #   入力トークン数と出力トークン数を表示してみよう（Copilotに頼んでよい）
+    response = chat.send_message(question)
+
+    usage = getattr(response, "usage_metadata", None)
+    input_tokens = getattr(usage, "prompt_token_count", None)
+    output_tokens = getattr(usage, "candidates_token_count", None)
+    if input_tokens is not None:
+        print(f"[input tokens] {input_tokens}")
+    if output_tokens is not None:
+        print(f"[output tokens] {output_tokens}")
 
     return response.text
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="素のLLMに質問する")
-    parser.add_argument("question", nargs="?", default=DEFAULT_QUESTION)
+    parser.add_argument("question", nargs="?", default=None)
     args = parser.parse_args()
 
     print(f"[model] {MODEL}")
-    print(f"[質問] {args.question}\n")
+
     try:
-        print(ask(args.question))
+        if args.question:
+            print(f"[質問] {args.question}\n")
+            print(ask(args.question))
+            return
+
+        client = genai.Client(api_key=get_api_key())
+        chat = client.chats.create(model=MODEL)
+        print("会話モードです。終了するには空行を入力してください。")
+        while True:
+            question = input("\n質問> ").strip()
+            if not question:
+                break
+            print(f"[質問] {question}\n")
+            print(ask(question, chat=chat))
     except errors.APIError as e:
         print(api_error_message(e.code, e.message))
         raise SystemExit(1)
