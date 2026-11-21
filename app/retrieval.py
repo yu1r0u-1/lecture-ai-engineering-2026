@@ -92,6 +92,34 @@ def normalized_vector(values: list[float]) -> list[float]:
     return [value / norm for value in values]
 
 
+def add_neighbor_context(hit: dict, pages: list[dict]) -> dict:
+    """検索ヒットに、同じ資料内の前後1ページを重複なく付ける。"""
+    same_document = [
+        page for page in pages
+        if page["document_id"] == hit["document_id"]
+    ]
+    hit_index = next(
+        (i for i, page in enumerate(same_document)
+         if page["page_id"] == hit["page_id"]
+         and ("content" not in hit or page["content"] == hit["content"])),
+        None,
+    )
+    if hit_index is None:
+        return {**hit, "context_pages": []}
+
+    context_pages = same_document[max(0, hit_index - 1):hit_index + 2]
+    context_pages = list({
+        page["page_id"]: page
+        for page in context_pages
+    }.values())
+
+    return {
+        **hit,
+        "content": "\n\n".join(page["content"] for page in context_pages),
+        "context_pages": context_pages,
+    }
+
+
 def embed_text(text: str, task_type: str) -> list[float]:
     """Geminiで文章を埋め込む。入力上限を超えた場合は切り捨てず停止する。"""
     with genai.Client(api_key=get_api_key()) as client:
@@ -128,6 +156,7 @@ def search(query: str) -> list[dict]:
     """質問を埋め込み、近いページを最大RAG_TOP_K件返す。"""
     if not isinstance(query, str) or not query.strip():
         raise ValueError("検索語が空です。")
+    pages = load_pages(RAG_SOURCE)
     with open_index(RAG_DB) as db:
         vector = embed_text(query.strip(), "RETRIEVAL_QUERY")
         rows = db.execute("""
@@ -135,12 +164,13 @@ def search(query: str) -> list[dict]:
                    vec_distance_cosine(embedding, ?) AS distance
             FROM chunks ORDER BY distance, page_id LIMIT ?
         """, (sqlite_vec.serialize_float32(vector), RAG_TOP_K))
-        return [dict(row) for row in rows]
+        return [add_neighbor_context(dict(row), pages) for row in rows]
 
 
 def search_graph(query: str) -> dict:
     """ベクトル検索を入口に、前後ページと共通用語で候補を広げる。"""
-    pages = {page["page_id"]: page for page in load_pages(RAG_SOURCE)}
+    page_list = load_pages(RAG_SOURCE)
+    pages = {page["page_id"]: page for page in page_list}
     graph = json.loads(RAG_GRAPH.read_text(encoding="utf-8"))
     nodes = {node["id"]: node for node in graph["nodes"]
              if node["kind"] == "term" or node["id"] in pages}
@@ -156,7 +186,7 @@ def search_graph(query: str) -> dict:
     results, candidates = [], {}
     for rank, seed in enumerate(seeds):
         root = seed["page_id"]
-        results.append({**pages[root], "distance": seed["distance"], "hops": 0,
+        results.append({**seed, "hops": 0,
                         "path": [{"id": root, "title": pages[root]["title"]}]})
         queue = deque([(root, [root])])
         visited = {root}
@@ -176,8 +206,11 @@ def search_graph(query: str) -> dict:
                     continue
                 frequency = max((len(adjacent[n]) for n in route if nodes[n]["kind"] == "term"), default=0)
                 priority = (len(route) - 1, frequency, rank, neighbor)
-                candidate = {**pages[neighbor], "hops": len(route) - 1,
-                             "path": [{"id": n, "title": nodes[n]["title"]} for n in route]}
+                candidate = add_neighbor_context(
+                    {**pages[neighbor], "hops": len(route) - 1,
+                     "path": [{"id": n, "title": nodes[n]["title"]} for n in route]},
+                    page_list,
+                )
                 if neighbor not in candidates or priority < candidates[neighbor][0]:
                     candidates[neighbor] = (priority, candidate)
     expanded = [candidate for _, candidate in sorted(candidates.values())]
